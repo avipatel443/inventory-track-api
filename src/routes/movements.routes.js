@@ -10,6 +10,10 @@ const router = express.Router();
  * - IN: on_hand += quantity
  * - OUT: on_hand -= quantity (reject if would go negative)
  * - ADJUST: on_hand = quantity  (treat quantity as the NEW on_hand)
+ *
+ * Adds optional:
+ * - from_location
+ * - to_location
  */
 
 // GET /api/movements
@@ -33,7 +37,7 @@ router.get("/", authRequired, async (req, res) => {
     }
     if (type) {
       sql += " AND sm.type = ?";
-      params.push(type);
+      params.push(String(type).toUpperCase());
     }
 
     sql += " ORDER BY sm.created_at DESC LIMIT 500";
@@ -50,13 +54,13 @@ router.post("/", authRequired, async (req, res) => {
   const conn = await pool.getConnection();
 
   try {
-    const { product_id, type, quantity, note } = req.body;
+    const { product_id, type, quantity, note, from_location, to_location } = req.body;
 
     if (!product_id || !type || quantity === undefined) {
       return res.status(400).json({ message: "product_id, type, quantity are required" });
     }
 
-    const t = String(type).toUpperCase();
+    const t = String(type).trim().toUpperCase();
     if (!["IN", "OUT", "ADJUST"].includes(t)) {
       return res.status(400).json({ message: "type must be IN, OUT, or ADJUST" });
     }
@@ -66,9 +70,24 @@ router.post("/", authRequired, async (req, res) => {
       return res.status(400).json({ message: "quantity must be a non-negative integer" });
     }
 
+    // Optional from/to validation (keep simple)
+    const fromLoc = from_location != null ? String(from_location).trim() : null;
+    const toLoc = to_location != null ? String(to_location).trim() : null;
+
+    if (fromLoc && fromLoc.length > 100) {
+      return res.status(400).json({ message: "from_location max length is 100" });
+    }
+    if (toLoc && toLoc.length > 100) {
+      return res.status(400).json({ message: "to_location max length is 100" });
+    }
+
     await conn.beginTransaction();
 
-    const [prodRows] = await conn.query("SELECT id, on_hand FROM products WHERE id = ? FOR UPDATE", [product_id]);
+    const [prodRows] = await conn.query(
+      "SELECT id, on_hand FROM products WHERE id = ? FOR UPDATE",
+      [product_id]
+    );
+
     if (!prodRows.length) {
       await conn.rollback();
       return res.status(404).json({ message: "Product not found" });
@@ -78,6 +97,7 @@ router.post("/", authRequired, async (req, res) => {
     let newOnHand = current;
 
     if (t === "IN") newOnHand = current + qty;
+
     if (t === "OUT") {
       newOnHand = current - qty;
       if (newOnHand < 0) {
@@ -85,11 +105,22 @@ router.post("/", authRequired, async (req, res) => {
         return res.status(400).json({ message: "Insufficient stock (cannot go negative)" });
       }
     }
-    if (t === "ADJUST") newOnHand = qty; // treat qty as the new stock level
+
+    if (t === "ADJUST") newOnHand = qty;
 
     const [ins] = await conn.query(
-      "INSERT INTO stock_movements (product_id, user_id, type, quantity, note) VALUES (?, ?, ?, ?, ?)",
-      [product_id, req.user.id, t, qty, note ?? null]
+      `INSERT INTO stock_movements
+        (product_id, user_id, type, quantity, from_location, to_location, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        product_id,
+        req.user.id,
+        t,
+        qty,
+        fromLoc,
+        toLoc,
+        note ?? null
+      ]
     );
 
     await conn.query("UPDATE products SET on_hand = ? WHERE id = ?", [newOnHand, product_id]);
@@ -110,9 +141,18 @@ router.post("/", authRequired, async (req, res) => {
 router.put("/:id", authRequired, requireRole("admin"), async (req, res) => {
   try {
     const pool = getPool();
-    const { note } = req.body;
-    const [result] = await pool.query("UPDATE stock_movements SET note = ? WHERE id = ?", [note ?? null, req.params.id]);
+    const { note, from_location, to_location } = req.body;
+
+    const fromLoc = from_location != null ? String(from_location).trim() : null;
+    const toLoc = to_location != null ? String(to_location).trim() : null;
+
+    const [result] = await pool.query(
+      "UPDATE stock_movements SET note = ?, from_location = ?, to_location = ? WHERE id = ?",
+      [note ?? null, fromLoc, toLoc, req.params.id]
+    );
+
     if (result.affectedRows === 0) return res.status(404).json({ message: "Movement not found" });
+
     const [rows] = await pool.query("SELECT * FROM stock_movements WHERE id = ?", [req.params.id]);
     return res.json(rows[0]);
   } catch (err) {
